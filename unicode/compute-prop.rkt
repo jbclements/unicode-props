@@ -1,22 +1,133 @@
 #lang racket
 
-(require net/url)
+(require net/url
+         file/sha1
+         racket/runtime-path)
 
+;; evaluating this file refreshes the unicode property predicates by
+;; - downloading the required text files from unicode.org,
+;; - comparing a hash of this file against the generated files, and
+;; - regenerating those source files if necessary.
+
+;; specifies which properties we care about. 
+;; a prop-file is (list/c source-file-name target-file-name (listof prop))
+;; a prop is (list/c unicode-prop-name racket-prop-name)
+
+;; this is (listof prop-file) :
 (define props
   `(("DerivedCoreProperties.txt"
      "derived-core-properties.rkt"
-     (("XID_Start" xid-start)
-      ("XID_Continue" xid-continue)))))
+     (("XID_Start" "xid-start")
+      ("XID_Continue" "xid-continue")))))
+
+;; where to find the unicode text files:
+;; (sadly, it seems unicode does not feel that the system
+;; is stable enough to provide version-independent URLS
+;; here. To go to a new version, change the version number
+;; and hope that the new directory has the same format as
+;; the old one.
+(define unicode-url-stem
+  "http://www.unicode.org/Public/6.2.0/ucd/")
+
+;; give up if the download takes more than this many seconds:
+(define download-timeout-secs 30)
+
+(define-runtime-path here ".")
+
+;; download unicode files, rebuild the corresponding racket files.
+(define (maybe-rebuild-source-files)
+  (for ([record props])
+    (match-define (list source-file target-file props) record)
+    (log-info (~a "fetching unicode source file: " source-file))
+    (define ucd-file (fetch-file source-file))
+    (log-info (~a "downloaded file to path: " ucd-file))
+    (define hash (call-with-input-file ucd-file sha1))
+    (log-info (~a "file has hash: " hash))
+    (define target-path (build-path here target-file))
+    (cond [(file-exists? target-path)
+           (cond [(out-of-date? target-path hash)
+                  (log-info (~a "rebuilding source file: "
+                                target-path))
+                  (delete-file target-path)
+                  (build-source-file ucd-file hash 
+                                     target-path props)]
+                 [else
+                  (log-info "file was already up to date")])]
+          [else
+           (log-info
+            (~a "building source file: " target-path))
+           (build-source-file ucd-file hash target-path props)])
+    (log-info (~a "deleting temp file: "ucd-file))
+    (delete-file ucd-file)))
+
+;; given a path to the UCD text file, the hash of that file,
+;; the path of the target (rkt) files, and the prop info, 
+;; construct the target file
+;; EFFECT : writes the named target-path
+(define (build-source-file ucd-file-path hash target-path props)
+  (define fn-sexps
+    (for/list ([p props])
+      (match-define (list prop-name fn-symbol) p)
+      `(define ,(string->symbol 
+                 (string-append fn-symbol "-codepoint?"))
+         ,(membership-fn ucd-file-path prop-name))))
+  (call-with-output-file target-path
+    (lambda (port)
+      ;; this feels dirty, somehow... :)
+      (fprintf port "#lang racket\n")
+      (fprintf port ";; HASH ~a\n\n" hash)
+      (fprintf port "(provide (all-defined-out))\n\n")
+      (for ([sexp fn-sexps])
+        (pretty-write sexp port)
+        (newline port)
+        (newline port))
+      
+      )))
 
 ;; given a file in the unicode UCD directory, fetch it to a temp file and return the name:
 (define (fetch-file text-file-name)
   (define temp-f (make-temporary-file))
+  (define url (string->url (~a unicode-url-stem text-file-name)))
   (call-with-output-file temp-f
     #:exists 'truncate
     (lambda (op)
-      (copy-port
-       (get-pure-port (string->url (~a "http://www.unicode.org/Public/6.2.0/ucd/" text-file-name)))
-       op))))
+      (define (destroy-file!)
+        (close-output-port op)
+        (delete-file temp-f))
+      (define download-successful? (box #f))
+      (define download-thread
+        (thread
+         (lambda ()
+           (define-values (port headers)
+             (get-pure-port/headers url #:status? #t))
+           (unless (status-200? headers)
+             (error 
+              'fetch-file
+              "expected successful http response for URL ~e, got: ~e"
+              (url->string url)
+              headers))
+           (copy-port (get-pure-port url) op)
+           (set-box! download-successful? #t))))
+      (match (sync/timeout download-timeout-secs download-thread)
+        [#f 
+         ;; it timed out:
+         (kill-thread download-thread)
+         (destroy-file!)
+         (error 'fetch-file 
+                "timeout while downloading file: ~e"
+                (url->string url))]
+        [other
+         (cond [(unbox download-successful?)
+                #t]
+               [else
+                (destroy-file!)
+                (error 'fetch-file
+                       "download thread halted unsuccessfully")])])))
+  temp-f)
+
+;; does the header string begin with status 200 (ok) ?
+(define (status-200? header-bytes)
+  (regexp-match #px#"^HTTP/[0-9.]+ 200" header-bytes))
 
 ;; path-string string -> syntax
 ;; given a file and a character class mentioned in the file,
@@ -47,7 +158,30 @@
 (define (hex->num str)
   (string->number str 16))
 
-(define xid-start-fn 
+
+;; given a target-path and a hash, return true if the given
+;; file's hash is not equal to the given hash
+(define (out-of-date? target-path expected-hash)
+  (call-with-input-file target-path
+    (lambda (port)
+      (define line1 (read-line port))
+      (define expected-line1 "#lang racket")
+      (unless (string=? line1 expected-line1)
+        (error 'out-of-date "expected first line to be ~s, got ~e"
+               expected-line1 line1))
+      (define line2 (read-line port))
+      (match line2
+        [(regexp #px"^;; HASH ([[:xdigit:]]+)$"
+                 (list _ hash))
+         (log-info (~a "existing file has hash: "(~e hash)))
+         (not (string=? expected-hash hash))]
+        [other
+         (error 'out-of-date "expected second line to match hash-regexp, got: ~e"
+                other)]))))
+
+(maybe-rebuild-source-files)
+
+#;(define xid-start-fn 
   `(define xid-start-code-point? 
      ,(membership-fn "XID_Start")))
-(define xid-continue-fn (membership-fn "XID_Continue"))
+#;(define xid-continue-fn (membership-fn "XID_Continue"))
