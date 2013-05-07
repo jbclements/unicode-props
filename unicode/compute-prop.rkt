@@ -6,15 +6,16 @@
 
 ;; evaluating this file refreshes the unicode property predicates by
 ;; - downloading the required text files from unicode.org,
-;; - comparing a hash of this file against the generated files, and
-;; - regenerating those source files if necessary.
+;; - comparing a hash of this file against the generated files,
+;; - regenerating those source files if necessary, and
+;; - regenerate main.rkt if any of the source files have changed.
 
 ;; specifies which properties we care about. 
 ;; a prop-file is (list/c source-file-name target-file-name (listof prop))
 ;; a prop is (list/c unicode-prop-name racket-prop-name)
 
 ;; this is (listof prop-file) :
-(define props
+(define prop-files
   `(("DerivedCoreProperties.txt"
      "derived-core-properties.rkt"
      (("XID_Start" "xid-start")
@@ -27,16 +28,17 @@
 ;; and hope that the new directory has the same format as
 ;; the old one.
 (define unicode-url-stem
-  "http://www.unicode.org/Public/6.2.0/ucd/")
+  "http://www.unicode.org/Public/UNIDATA/")
 
-;; give up if the download takes more than this many seconds:
+;; give up if the download of a given file takes more than this many seconds:
 (define download-timeout-secs 30)
 
 (define-runtime-path here ".")
 
 ;; download unicode files, rebuild the corresponding racket files.
+;; returrn 'true' if any of the source files were (re)built
 (define (maybe-rebuild-source-files)
-  (for ([record props])
+  (for/or ([record prop-files])
     (match-define (list source-file target-file props) record)
     (log-info (~a "fetching unicode source file: " source-file))
     (define ucd-file (fetch-file source-file))
@@ -44,25 +46,27 @@
     (define hash (call-with-input-file ucd-file sha1))
     (log-info (~a "file has hash: " hash))
     (define target-path (build-path here target-file))
-    (cond [(file-exists? target-path)
-           (cond [(out-of-date? target-path hash)
-                  (log-info (~a "rebuilding source file: "
-                                target-path))
-                  (delete-file target-path)
-                  (build-source-file ucd-file hash 
-                                     target-path props)]
-                 [else
-                  (log-info "file was already up to date")])]
-          [else
-           (log-info
-            (~a "building source file: " target-path))
-           (build-source-file ucd-file hash target-path props)])
-    (log-info (~a "deleting temp file: "ucd-file))
-    (delete-file ucd-file)))
+    (begin0
+      (cond [(file-exists? target-path)
+             (cond [(out-of-date? target-path hash)
+                    (log-info (~a "rebuilding source file: "
+                                  target-path))
+                    (delete-file target-path)
+                    (build-source-file ucd-file hash 
+                                       target-path props)]
+                   [else
+                    (log-info "file was already up to date")
+                    #f])]
+            [else
+             (log-info
+              (~a "building source file: " target-path))
+             (build-source-file ucd-file hash target-path props)])
+      (log-info (~a "deleting temp file: "ucd-file))
+      (delete-file ucd-file))))
 
 ;; given a path to the UCD text file, the hash of that file,
 ;; the path of the target (rkt) files, and the prop info, 
-;; construct the target file
+;; construct the target file. returns true.
 ;; EFFECT : writes the named target-path
 (define (build-source-file ucd-file-path hash target-path props)
   (define fn-sexps
@@ -82,7 +86,8 @@
         (newline port)
         (newline port))
       
-      )))
+      ))
+  #t)
 
 ;; given a file in the unicode UCD directory, fetch it to a temp file and return the name:
 (define (fetch-file text-file-name)
