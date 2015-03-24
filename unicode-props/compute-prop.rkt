@@ -40,7 +40,7 @@
   "http://www.unicode.org/Public/UNIDATA/")
 
 ;; give up if the download of a given file takes more than this many seconds:
-(define download-timeout-secs 30)
+(define DOWNLOAD-TIMEOUT-SECS 60)
 
 (define-runtime-path here ".")
 
@@ -156,7 +156,7 @@
               headers))
            (copy-port (get-pure-port url) op)
            (set-box! download-successful? #t))))
-      (match (sync/timeout download-timeout-secs download-thread)
+      (match (sync/timeout DOWNLOAD-TIMEOUT-SECS download-thread)
         [#f 
          ;; it timed out:
          (kill-thread download-thread)
@@ -234,3 +234,7 @@
   `(define xid-start-code-point? 
      ,(membership-fn "XID_Start")))
 #;(define xid-continue-fn (membership-fn "XID_Continue"))
+
+(module* test racket
+  ;; don't run this file during testing.
+  )
