@@ -2,7 +2,7 @@
 
 @(require scribble/manual)
 
-@title{@bold{Unicode Chars}}
+@title{Unicode Chars}
 
 @author[(author+email "John Clements" "clements@racket-lang.org")]
 
